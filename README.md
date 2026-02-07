@@ -1,0 +1,110 @@
+# CoderLM
+
+CoderLM applies the [Recursive Language Model](https://arxiv.org/abs/2512.24601) (RLM) pattern to codebases. A Rust server indexes a project's files and symbols via tree-sitter, then exposes a JSON API that LLM agents query for targeted context — structure, symbols, source code, callers, tests, and grep. Instead of loading an entire codebase into context or relying on heuristic file scanning, the agent asks the server for exactly what it needs.
+
+An integrated Claude Code skill (`.claude/skills/coderlm/`) wraps the API with a Python CLI and a structured workflow, so Claude Code can explore unfamiliar codebases without reading everything into context.
+
+## How It Works
+
+The RLM pattern treats a codebase as external data that a root language model can recursively examine and decompose:
+
+1. **Index** — The server walks the project directory (respecting `.gitignore`), parses every supported file with tree-sitter, and builds a symbol table with cross-references.
+2. **Query** — The agent queries the index: search symbols by name, list functions in a file, find callers of a function, grep for patterns, retrieve exact source code.
+3. **Read** — The server returns the exact code requested — full function implementations, variable lists, line ranges — so the agent never guesses.
+4. **Recurse** — A sub-agent (Haiku) can be delegated focused analysis of specific files, returning structured findings without loading code into the root agent's context.
+
+This replaces the typical glob/grep/read cycle with precise, index-backed lookups.
+
+## Origins
+
+This project builds on two prior works:
+
+- **"Recursive Language Models"** by Alex L. Zhang, Tim Kraska, and Omar Khattab (MIT CSAIL, 2025). The paper introduces the RLM framework for processing inputs far beyond model context windows by treating extended prompts as external data that the model recursively examines.
+  > Zhang, A. L., Kraska, T., & Khattab, O. (2025). Recursive Language Models. *arXiv preprint* [arXiv:2512.24601](https://arxiv.org/abs/2512.24601).
+
+- **[brainqub3/claude_code_RLM](https://github.com/brainqub3/claude_code_RLM)** — A minimal RLM implementation for Claude Code by brainqub3 that applies the pattern to document processing via a persistent Python REPL. CoderLM adapts this approach from documents to codebases, replacing the Python REPL with a purpose-built Rust server and tree-sitter indexing.
+
+## Repository Layout
+
+```
+server/                          Rust server (the only built artifact)
+.claude/skills/coderlm/          Claude Code skill + Python CLI wrapper
+.claude/agents/coderlm-subcall.md  Sub-agent for delegated code analysis
+scripts/                         Daemon management script
+modal_repl.py                    Original RLM research implementation (reference)
+brainqub3/                       brainqub3's document-focused RLM (reference)
+```
+
+## Quick Start
+
+### Build
+
+```bash
+cd server && cargo build --release
+```
+
+### Run
+
+```bash
+# Direct
+cd server && cargo run --release -- serve /path/to/project
+
+# As a daemon (see scripts/coderlm-daemon.sh)
+./scripts/coderlm-daemon.sh start
+./scripts/coderlm-daemon.sh status
+./scripts/coderlm-daemon.sh stop
+```
+
+### Verify
+
+```bash
+curl http://127.0.0.1:3000/api/v1/health
+```
+
+### Use with Claude Code
+
+Once the server is running, invoke the skill from Claude Code:
+
+```
+/coderlm query="how does authentication work?"
+```
+
+Or use the CLI directly:
+
+```bash
+python3 .claude/skills/coderlm/scripts/coderlm_cli.py init
+python3 .claude/skills/coderlm/scripts/coderlm_cli.py search "handler"
+python3 .claude/skills/coderlm/scripts/coderlm_cli.py impl run_server --file src/main.rs
+```
+
+## Server CLI
+
+```
+coderlm-server serve [PATH] [OPTIONS]
+
+Options:
+  -p, --port <PORT>              Port to listen on [default: 3000]
+  -b, --bind <ADDR>              Bind address [default: 127.0.0.1]
+      --max-file-size <BYTES>    Max file size to index [default: 1048576]
+      --max-projects <N>         Max concurrent indexed projects [default: 5]
+```
+
+## Supported Languages
+
+| Language   | Extensions                    |
+|------------|-------------------------------|
+| Rust       | `.rs`                         |
+| Python     | `.py`, `.pyi`                 |
+| TypeScript | `.ts`, `.tsx`                 |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Go         | `.go`                         |
+
+All file types appear in the file tree and are searchable via peek/grep, but only the above produce parsed symbols.
+
+## API
+
+All endpoints under `/api/v1/`. See [`server/REPL_to_API.md`](server/REPL_to_API.md) for the full endpoint reference with curl examples.
+
+## License
+
+MIT
