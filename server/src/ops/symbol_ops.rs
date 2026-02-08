@@ -1,9 +1,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use tree_sitter::StreamingIterator;
+
+use crate::index::file_entry::Language;
+use crate::index::file_tree::FileTree;
+use crate::symbols::queries;
 use crate::symbols::symbol::{Symbol, SymbolKind};
 use crate::symbols::SymbolTable;
-use crate::index::file_tree::FileTree;
 
 pub fn list_symbols(
     symbol_table: &Arc<SymbolTable>,
@@ -85,8 +89,8 @@ pub fn redefine_symbol(
     }
 }
 
-/// Find callers of a symbol by grepping for its name and optionally
-/// validating with tree-sitter that matches are call sites.
+/// Find callers of a symbol using tree-sitter call-expression queries.
+/// Falls back to regex for files without tree-sitter support.
 pub fn find_callers(
     root: &Path,
     file_tree: &Arc<FileTree>,
@@ -100,13 +104,11 @@ pub fn find_callers(
         .get(file, symbol_name)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
 
-    let pattern = regex::Regex::new(&regex::escape(symbol_name))
-        .map_err(|e| format!("Invalid pattern: {}", e))?;
-
     let mut callers = Vec::new();
 
     for entry in file_tree.files.iter() {
         let rel_path = entry.key().clone();
+        let language = entry.value().language;
         let abs_path = root.join(&rel_path);
 
         let source = match std::fs::read_to_string(&abs_path) {
@@ -114,36 +116,141 @@ pub fn find_callers(
             Err(_) => continue,
         };
 
-        for (line_num, line) in source.lines().enumerate() {
-            if pattern.is_match(line) {
-                // Skip the definition itself
-                if rel_path == file && line.contains(&format!("fn {}", symbol_name)) {
-                    continue;
-                }
-                if rel_path == file && line.contains(&format!("def {}", symbol_name)) {
-                    continue;
-                }
-                if rel_path == file && line.contains(&format!("function {}", symbol_name)) {
-                    continue;
-                }
-                if rel_path == file && line.contains(&format!("func {}", symbol_name)) {
-                    continue;
-                }
+        let file_callers = if language.has_tree_sitter_support() {
+            find_callers_ast(&source, &rel_path, language, symbol_name, file)
+        } else {
+            find_callers_regex(&source, &rel_path, symbol_name, file)
+        };
 
-                callers.push(CallerInfo {
-                    file: rel_path.clone(),
-                    line: line_num + 1,
-                    text: line.trim().to_string(),
-                });
-
-                if callers.len() >= limit {
-                    return Ok(callers);
-                }
+        for caller in file_callers {
+            callers.push(caller);
+            if callers.len() >= limit {
+                return Ok(callers);
             }
         }
     }
 
     Ok(callers)
+}
+
+/// AST-aware caller detection: parse the file, run the callers query,
+/// and check if any call-expression callee matches the target symbol name.
+fn find_callers_ast(
+    source: &str,
+    rel_path: &str,
+    language: Language,
+    symbol_name: &str,
+    definition_file: &str,
+) -> Vec<CallerInfo> {
+    let config = match queries::get_language_config(language) {
+        Some(c) => c,
+        None => return find_callers_regex(source, rel_path, symbol_name, definition_file),
+    };
+
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&config.language).is_err() {
+        return find_callers_regex(source, rel_path, symbol_name, definition_file);
+    }
+
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return find_callers_regex(source, rel_path, symbol_name, definition_file),
+    };
+
+    let query = match tree_sitter::Query::new(&config.language, config.callers_query) {
+        Ok(q) => q,
+        Err(_) => return find_callers_regex(source, rel_path, symbol_name, definition_file),
+    };
+
+    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let callee_idx = capture_names.iter().position(|n| n == "callee");
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut callers = Vec::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if Some(cap.index as usize) == callee_idx {
+                let text = cap.node.utf8_text(source.as_bytes()).unwrap_or("");
+                if text == symbol_name {
+                    let line_num = cap.node.start_position().row + 1;
+                    // Skip the definition itself
+                    if rel_path == definition_file {
+                        let line_text = source
+                            .lines()
+                            .nth(line_num - 1)
+                            .unwrap_or("");
+                        if is_definition_line(line_text, symbol_name, language) {
+                            continue;
+                        }
+                    }
+                    let line_text = source
+                        .lines()
+                        .nth(line_num - 1)
+                        .map(|l| l.trim().to_string())
+                        .unwrap_or_default();
+                    callers.push(CallerInfo {
+                        file: rel_path.to_string(),
+                        line: line_num,
+                        text: line_text,
+                    });
+                }
+            }
+        }
+    }
+
+    callers
+}
+
+/// Regex fallback for files without tree-sitter support.
+fn find_callers_regex(
+    source: &str,
+    rel_path: &str,
+    symbol_name: &str,
+    definition_file: &str,
+) -> Vec<CallerInfo> {
+    let pattern = match regex::Regex::new(&regex::escape(symbol_name)) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut callers = Vec::new();
+
+    for (line_num, line) in source.lines().enumerate() {
+        if pattern.is_match(line) {
+            // Skip the definition itself
+            if rel_path == definition_file
+                && (line.contains(&format!("fn {}", symbol_name))
+                    || line.contains(&format!("def {}", symbol_name))
+                    || line.contains(&format!("function {}", symbol_name))
+                    || line.contains(&format!("func {}", symbol_name)))
+            {
+                continue;
+            }
+
+            callers.push(CallerInfo {
+                file: rel_path.to_string(),
+                line: line_num + 1,
+                text: line.trim().to_string(),
+            });
+        }
+    }
+
+    callers
+}
+
+fn is_definition_line(line: &str, name: &str, language: Language) -> bool {
+    match language {
+        Language::Rust => line.contains(&format!("fn {}", name)),
+        Language::Python => line.contains(&format!("def {}", name)),
+        Language::TypeScript | Language::JavaScript => {
+            line.contains(&format!("function {}", name))
+                || line.contains(&format!("{} =", name))
+        }
+        Language::Go => line.contains(&format!("func {}", name)),
+        _ => false,
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -205,23 +312,20 @@ pub fn find_tests(
 
 fn is_test_symbol(sym: &Symbol) -> bool {
     match sym.language {
-        crate::index::file_entry::Language::Rust => {
-            // Rust: functions with #[test] attribute — heuristic: name starts with "test" or
-            // file is in tests/ dir, or function is in a #[cfg(test)] mod
+        Language::Rust => {
             sym.name.starts_with("test") || sym.file.contains("/tests/")
         }
-        crate::index::file_entry::Language::Python => {
+        Language::Python => {
             sym.name.starts_with("test_")
                 || sym.file.contains("test_")
                 || sym.file.contains("_test.")
         }
-        crate::index::file_entry::Language::TypeScript
-        | crate::index::file_entry::Language::JavaScript => {
+        Language::TypeScript | Language::JavaScript => {
             sym.file.contains(".test.")
                 || sym.file.contains(".spec.")
                 || sym.file.contains("__tests__")
         }
-        crate::index::file_entry::Language::Go => {
+        Language::Go => {
             sym.name.starts_with("Test") || sym.file.ends_with("_test.go")
         }
         _ => false,
@@ -236,7 +340,8 @@ pub struct TestInfo {
     pub signature: String,
 }
 
-/// List local variables within a function.
+/// List local variables within a function using tree-sitter queries.
+/// Falls back to regex for languages without tree-sitter support.
 pub fn list_variables(
     root: &Path,
     symbol_table: &Arc<SymbolTable>,
@@ -253,13 +358,82 @@ pub fn list_variables(
 
     let start = sym.byte_range.0;
     let end = sym.byte_range.1.min(source.len());
-    let body = &source[start..end];
 
+    let variables = if sym.language.has_tree_sitter_support() {
+        list_variables_ast(&source, sym.language, start, end, function_name)
+    } else {
+        list_variables_regex(&source[start..end], sym.language, function_name)
+    };
+
+    Ok(variables)
+}
+
+/// AST-aware variable extraction: parse the function body slice, run the
+/// variables query, and collect all @var.name captures within the byte range.
+fn list_variables_ast(
+    source: &str,
+    language: Language,
+    fn_start: usize,
+    fn_end: usize,
+    function_name: &str,
+) -> Vec<VariableInfo> {
+    let config = match queries::get_language_config(language) {
+        Some(c) => c,
+        None => return list_variables_regex(&source[fn_start..fn_end], language, function_name),
+    };
+
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&config.language).is_err() {
+        return list_variables_regex(&source[fn_start..fn_end], language, function_name);
+    }
+
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return list_variables_regex(&source[fn_start..fn_end], language, function_name),
+    };
+
+    let query = match tree_sitter::Query::new(&config.language, config.variables_query) {
+        Ok(q) => q,
+        Err(_) => return list_variables_regex(&source[fn_start..fn_end], language, function_name),
+    };
+
+    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let var_name_idx = capture_names.iter().position(|n| n == "var.name");
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    // Restrict matches to the function's byte range
+    cursor.set_byte_range(fn_start..fn_end);
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut variables = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if Some(cap.index as usize) == var_name_idx {
+                let text = cap.node.utf8_text(source.as_bytes()).unwrap_or("");
+                if !text.is_empty() && text != "self" && text != "_" && seen.insert(text.to_string()) {
+                    variables.push(VariableInfo {
+                        name: text.to_string(),
+                        function: function_name.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    variables
+}
+
+/// Regex fallback for variable extraction.
+fn list_variables_regex(
+    body: &str,
+    language: Language,
+    function_name: &str,
+) -> Vec<VariableInfo> {
     let mut variables = Vec::new();
 
-    // Simple heuristic-based variable extraction per language
-    match sym.language {
-        crate::index::file_entry::Language::Rust => {
+    match language {
+        Language::Rust => {
             let let_re = regex::Regex::new(r"let\s+(mut\s+)?(\w+)").unwrap();
             for cap in let_re.captures_iter(body) {
                 variables.push(VariableInfo {
@@ -268,7 +442,7 @@ pub fn list_variables(
                 });
             }
         }
-        crate::index::file_entry::Language::Python => {
+        Language::Python => {
             let assign_re = regex::Regex::new(r"^\s+(\w+)\s*=").unwrap();
             for cap in assign_re.captures_iter(body) {
                 let name = cap[1].to_string();
@@ -280,8 +454,7 @@ pub fn list_variables(
                 }
             }
         }
-        crate::index::file_entry::Language::TypeScript
-        | crate::index::file_entry::Language::JavaScript => {
+        Language::TypeScript | Language::JavaScript => {
             let var_re = regex::Regex::new(r"(?:let|const|var)\s+(\w+)").unwrap();
             for cap in var_re.captures_iter(body) {
                 variables.push(VariableInfo {
@@ -290,8 +463,7 @@ pub fn list_variables(
                 });
             }
         }
-        crate::index::file_entry::Language::Go => {
-            // Short variable declarations (:=) and var statements
+        Language::Go => {
             let short_re = regex::Regex::new(r"(\w+)\s*:=").unwrap();
             for cap in short_re.captures_iter(body) {
                 variables.push(VariableInfo {
@@ -314,7 +486,7 @@ pub fn list_variables(
     variables.sort_by(|a, b| a.name.cmp(&b.name));
     variables.dedup_by(|a, b| a.name == b.name);
 
-    Ok(variables)
+    variables
 }
 
 #[derive(Debug, serde::Serialize)]

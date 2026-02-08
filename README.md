@@ -29,41 +29,66 @@ This project builds on two prior works:
 ```
 server/                          Rust server (the only built artifact)
 .claude/skills/coderlm/          Claude Code skill + Python CLI wrapper
-.claude/agents/coderlm-subcall.md  Sub-agent for delegated code analysis
-scripts/                         Daemon management script
+.claude/agents/                  Tiered sub-agents (scout/analyst/architect)
+.claude-plugin/                  Plugin manifest for `claude plugin install`
+hooks/                           Claude Code hooks (SessionStart, UserPromptSubmit)
+commands/                        Slash command definitions
+scripts/                         Daemon management and hook scripts
 modal_repl.py                    Original RLM research implementation (reference)
 brainqub3/                       brainqub3's document-focused RLM (reference)
 ```
 
 ## Quick Start
 
-### Build
+### Option A: Install as a Claude Code Plugin
+
+The fastest way to get started. Requires Rust toolchain for building the server.
 
 ```bash
-cd server && cargo build --release
+# 1. Install the plugin (registers skill, hooks, and slash commands)
+claude plugin install github:jared/coderlm
+
+# 2. Build the server
+cd ~/.claude/plugins/cache/coderlm/coderlm/latest/server
+cargo build --release
+
+# 3. Start the server (in a separate terminal)
+cargo run --release -- serve
+
+# 4. Restart Claude Code — the SessionStart hook will auto-initialize
 ```
 
-### Run
+After installation, the `/coderlm` skill is available in every Claude Code session. The `UserPromptSubmit` hook guides Claude to use it automatically for code exploration tasks.
+
+### Option B: Install from Source
 
 ```bash
-# Direct
-cd server && cargo run --release -- serve /path/to/project
+# 1. Clone the repository
+git clone https://github.com/jared/coderlm.git
+cd coderlm
 
-# As a daemon (see scripts/coderlm-daemon.sh)
+# 2. Build the server
+cd server && cargo build --release
+
+# 3. Start the server
+cargo run --release -- serve /path/to/your/project
+
+# 4. (Optional) Run as a daemon
 ./scripts/coderlm-daemon.sh start
 ./scripts/coderlm-daemon.sh status
 ./scripts/coderlm-daemon.sh stop
 ```
 
-### Verify
+### Verify the Server
 
 ```bash
 curl http://127.0.0.1:3000/api/v1/health
+# → {"status":"ok","projects":0,"active_sessions":0,"max_projects":5}
 ```
 
 ### Use with Claude Code
 
-Once the server is running, invoke the skill from Claude Code:
+Once the server is running, invoke the skill:
 
 ```
 /coderlm query="how does authentication work?"
@@ -76,6 +101,25 @@ python3 .claude/skills/coderlm/scripts/coderlm_cli.py init
 python3 .claude/skills/coderlm/scripts/coderlm_cli.py search "handler"
 python3 .claude/skills/coderlm/scripts/coderlm_cli.py impl run_server --file src/main.rs
 ```
+
+### Updating
+
+```bash
+claude plugin update coderlm
+# Rebuild the server after updating
+cd ~/.claude/plugins/cache/coderlm/coderlm/latest/server
+cargo build --release
+```
+
+## What the Plugin Provides
+
+When installed, CodeRLM gives Claude Code:
+
+- **`/coderlm` skill** — Structured workflow for codebase exploration (init → structure → search → impl → callers → synthesize)
+- **Tiered sub-agents** — `coderlm-scout` (Haiku, quick lookups), `coderlm-analyst` (Sonnet, multi-file tracing), `coderlm-architect` (Opus, architectural reasoning)
+- **SessionStart hook** — Auto-detects a running server and initializes sessions
+- **UserPromptSubmit hook** — Guides Claude to use indexed lookups instead of glob/grep/read
+- **Zero Python dependencies** — The CLI wrapper uses only the Python standard library
 
 ## Server CLI
 

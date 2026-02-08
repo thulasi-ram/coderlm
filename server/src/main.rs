@@ -54,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    info!("coderlm v{}", env!("CARGO_PKG_VERSION"));
+
     let cli = Cli::parse();
 
     match cli.command {

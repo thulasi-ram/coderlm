@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::ops::{content, history, structure, symbol_ops};
+use crate::ops::{annotations, content, history, structure, symbol_ops};
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::server::state::{AppState, Project};
@@ -29,7 +29,7 @@ fn require_session(headers: &HeaderMap) -> Result<String, AppError> {
     session_id(headers).ok_or_else(|| AppError::BadRequest("Missing X-Session-Id header".into()))
 }
 
-/// Resolve session → project. Touches last_active on both session and project.
+/// Resolve session -> project. Touches last_active on both session and project.
 fn require_project(state: &AppState, headers: &HeaderMap) -> Result<Arc<Project>, AppError> {
     let sid = require_session(headers)?;
     let project = state.get_project_for_session(&sid)?;
@@ -83,6 +83,9 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/chunk_indices", get(chunk_indices))
         // History
         .route("/api/v1/history", get(get_history))
+        // Annotations
+        .route("/api/v1/annotations/save", post(save_annotations))
+        .route("/api/v1/annotations/load", post(load_annotations))
         .with_state(state)
 }
 
@@ -154,6 +157,16 @@ async fn create_session(
     let session = Session::new(id.clone(), project.root.clone());
     let created_at = session.created_at;
     state.inner.sessions.insert(id.clone(), session);
+
+    // Load annotations from disk after project is indexed
+    let ft = project.file_tree.clone();
+    let st = project.symbol_table.clone();
+    let root = project.root.clone();
+    tokio::spawn(async move {
+        // Small delay to let symbol extraction start first
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = annotations::load_annotations(&root, &ft, &st);
+    });
 
     Ok(Json(json!({
         "session_id": id,
@@ -530,6 +543,8 @@ struct GrepQuery {
     pattern: String,
     max_matches: Option<usize>,
     context_lines: Option<usize>,
+    /// Optional scope filter: "all" (default) or "code" (skip comments/strings).
+    scope: Option<String>,
 }
 
 async fn grep_handler(
@@ -540,6 +555,12 @@ async fn grep_handler(
     let project = require_project(&state, &headers)?;
     let max_matches = params.max_matches.unwrap_or(50);
     let context_lines = params.context_lines.unwrap_or(2);
+    let scope = params
+        .scope
+        .as_deref()
+        .map(|s| content::GrepScope::from_str(s))
+        .flatten()
+        .unwrap_or(content::GrepScope::All);
 
     // Run grep on a blocking thread since it reads many files
     let root = project.root.clone();
@@ -547,7 +568,7 @@ async fn grep_handler(
     let pattern = params.pattern.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        content::grep(&root, &file_tree, &pattern, max_matches, context_lines)
+        content::grep_with_scope(&root, &file_tree, &pattern, max_matches, context_lines, scope)
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -616,4 +637,39 @@ async fn get_history(
             Ok(Json(json!({ "sessions": blocks, "total_entries": total })))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Annotations
+// ---------------------------------------------------------------------------
+
+async fn save_annotations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    annotations::save_annotations(&project.root, &project.file_tree, &project.symbol_table)
+        .map_err(AppError::Internal)?;
+    record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/save", "saved");
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn load_annotations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    let data = annotations::load_annotations(
+        &project.root,
+        &project.file_tree,
+        &project.symbol_table,
+    )
+    .map_err(AppError::Internal)?;
+    let summary = json!({
+        "file_definitions": data.file_definitions.len(),
+        "file_marks": data.file_marks.len(),
+        "symbol_definitions": data.symbol_definitions.len(),
+    });
+    record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/load", "loaded");
+    Ok(Json(json!({ "ok": true, "loaded": summary })))
 }

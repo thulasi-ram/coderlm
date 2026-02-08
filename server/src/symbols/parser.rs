@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use streaming_iterator::StreamingIterator;
+use tree_sitter::StreamingIterator;
 use tracing::{debug, warn};
 
 use crate::index::file_entry::Language;

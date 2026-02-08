@@ -30,10 +30,38 @@ pub const SYMBOLS_QUERY: &str = r#"
     name: (identifier) @const.name)) @const.def
 "#;
 
+pub const CALLERS_QUERY: &str = r#"
+(call_expression
+  function: (identifier) @callee)
+
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @callee))
+"#;
+
+pub const VARIABLES_QUERY: &str = r#"
+(short_var_declaration
+  left: (expression_list
+    (identifier) @var.name))
+
+(var_declaration
+  (var_spec
+    name: (identifier) @var.name))
+
+(range_clause
+  left: (expression_list
+    (identifier) @var.name))
+
+(parameter_declaration
+  name: (identifier) @var.name)
+"#;
+
 pub fn config() -> LanguageConfig {
     LanguageConfig {
         language: tree_sitter_go::LANGUAGE.into(),
         symbols_query: SYMBOLS_QUERY,
+        callers_query: CALLERS_QUERY,
+        variables_query: VARIABLES_QUERY,
         test_patterns: vec![TestPattern::FunctionPrefix("Test")],
     }
 }

@@ -14,13 +14,15 @@ Usage:
   python3 coderlm_cli.py tests SYMBOL --file FILE [--limit N]
   python3 coderlm_cli.py variables FUNCTION --file FILE
   python3 coderlm_cli.py peek FILE [--start N] [--end N]
-  python3 coderlm_cli.py grep PATTERN [--max-matches N] [--context-lines N]
+  python3 coderlm_cli.py grep PATTERN [--max-matches N] [--context-lines N] [--scope all|code]
   python3 coderlm_cli.py chunks FILE [--size N] [--overlap N]
   python3 coderlm_cli.py define-file FILE DEFINITION
   python3 coderlm_cli.py redefine-file FILE DEFINITION
   python3 coderlm_cli.py define-symbol SYMBOL --file FILE DEFINITION
   python3 coderlm_cli.py redefine-symbol SYMBOL --file FILE DEFINITION
   python3 coderlm_cli.py mark FILE TYPE
+  python3 coderlm_cli.py save-annotations
+  python3 coderlm_cli.py load-annotations
   python3 coderlm_cli.py history [--limit N]
   python3 coderlm_cli.py status
   python3 coderlm_cli.py cleanup
@@ -273,6 +275,8 @@ def cmd_grep(args: argparse.Namespace) -> None:
         params["max_matches"] = args.max_matches
     if args.context_lines is not None:
         params["context_lines"] = args.context_lines
+    if args.scope is not None:
+        params["scope"] = args.scope
     _output(_get(state, "/grep", params))
 
 
@@ -334,6 +338,16 @@ def cmd_history(args: argparse.Namespace) -> None:
     if args.limit is not None:
         params["limit"] = args.limit
     _output(_get(state, "/history", params))
+
+
+def cmd_save_annotations(args: argparse.Namespace) -> None:
+    state = _load_state()
+    _output(_post(state, "/annotations/save", {}))
+
+
+def cmd_load_annotations(args: argparse.Namespace) -> None:
+    state = _load_state()
+    _output(_post(state, "/annotations/load", {}))
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
@@ -429,6 +443,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_grep.add_argument("pattern", help="Regex pattern")
     p_grep.add_argument("--max-matches", type=int, default=None)
     p_grep.add_argument("--context-lines", type=int, default=None)
+    p_grep.add_argument("--scope", choices=["all", "code"], default=None,
+                         help="Scope filter: 'all' (default) or 'code' (skip comments/strings)")
     p_grep.set_defaults(func=cmd_grep)
 
     # chunks
@@ -475,6 +491,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_hist = sub.add_parser("history", help="Session command history")
     p_hist.add_argument("--limit", type=int, default=None)
     p_hist.set_defaults(func=cmd_history)
+
+    # save-annotations
+    p_save = sub.add_parser("save-annotations", help="Save annotations to disk (.coderlm/annotations.json)")
+    p_save.set_defaults(func=cmd_save_annotations)
+
+    # load-annotations
+    p_load = sub.add_parser("load-annotations", help="Load annotations from disk")
+    p_load.set_defaults(func=cmd_load_annotations)
 
     # cleanup
     p_clean = sub.add_parser("cleanup", help="Delete the current session")

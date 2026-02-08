@@ -93,7 +93,7 @@ fn insert_into_tree(tree: &mut BTreeMap<String, TreeNode>, parts: &[&str], idx: 
         let node = tree
             .entry(name)
             .or_insert_with(|| TreeNode::Dir(BTreeMap::new()));
-        if let TreeNode::Dir(ref mut children) = node {
+        if let TreeNode::Dir(children) = node {
             insert_into_tree(children, parts, idx + 1);
         }
     }

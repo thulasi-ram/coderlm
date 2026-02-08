@@ -15,7 +15,7 @@ Codebases are hard to navigate. Functions have nonobvious names, functionality i
 
 CoderLM gives you a **complete index** of the project — every file, every symbol (function, class, struct, method), their signatures, callers, tests, and cross-references. **The server returns exact source code on demand**: full function bodies, variable declarations, precise line ranges. You never need to Read a 500-line file to find a 20-line function.
 
-This is the Recursive Language Model pattern applied to code: you are the root LLM, the coderlm-server is your external environment, and the `coderlm-subcall` agent handles focused analysis when needed.
+This is the Recursive Language Model pattern applied to code: you are the root LLM, the coderlm-server is your external environment, and three tiered agents handle focused analysis at different depths — `coderlm-scout` (Haiku) for quick lookups, `coderlm-analyst` (Sonnet) for multi-file tracing, and `coderlm-architect` (Opus) for architectural reasoning.
 
 ## What the Server Returns (Exact Code, Not Hints)
 
@@ -141,18 +141,42 @@ This reveals the nonobvious linkages between files that are hard to find manuall
 
 ### Step 6: Delegate Focused Analysis
 
-When you need to analyze a specific file or symbol in depth without loading it all into your context, delegate to the `coderlm-subcall` agent:
+When you need to analyze code without loading it all into your context, delegate to a tiered agent. Choose the right tier based on the question:
+
+| Question Type | Agent | Model | Examples |
+|---------------|-------|-------|----------|
+| Single-file lookup | `coderlm-scout` | Haiku | "What does fn X return?", relevance check |
+| Multi-file tracing | `coderlm-analyst` | Sonnet | "Trace callers of X", "How does A connect to B?" |
+| Architecture/design | `coderlm-architect` | Opus | "What's the module structure?", "How to refactor?" |
+
+**Decision heuristic:**
+- **Scout** (default): Use when the question can be answered by reading 1-2 files or running 1-2 CLI commands
+- **Analyst**: Use when the answer requires cross-referencing 3+ files, tracing call chains, or comparing implementations
+- **Architect**: Use when the question is about system design, trade-offs, refactoring strategy, or requires synthesizing understanding across the whole codebase
 
 ```
-Use the coderlm-subcall agent with:
-- File: src/complex_module.rs
-- Query: "How does this module handle authentication errors?"
+# Quick lookup — use scout (Haiku, fast and cheap)
+Use the coderlm-scout agent with:
+- File: src/ops/content.rs
+- Query: "What does the peek function return?"
+
+# Multi-file trace — use analyst (Sonnet, balanced)
+Use the coderlm-analyst agent with:
+- Symbol: grep_with_scope
+- Query: "Trace all callers of grep_with_scope and explain the call chain"
+
+# Architectural analysis — use architect (Opus, deep reasoning)
+Use the coderlm-architect agent with:
+- Module: src/ops/
+- Query: "What's the overall architecture of the ops module?"
 ```
 
-The subcall agent (Haiku) reads the code and returns structured JSON with findings, suggested next steps, and confidence levels. Use this for:
+All three agents return structured JSON with findings, suggested next steps, and confidence levels. Use them for:
 - Files you need analyzed but do not want to load into main context
-- Parallel analysis of multiple files
-- Quick relevance checks before committing to a deep dive
+- Parallel analysis of multiple files (spawn multiple scouts)
+- Quick relevance checks before committing to a deep dive (scout)
+- Cross-file dependency tracing (analyst)
+- System-level design understanding (architect)
 
 ### Step 7: Annotate
 

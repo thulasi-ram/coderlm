@@ -1,0 +1,16 @@
+{
+  "name": "coderlm",
+  "description": "Tree-sitter code indexing plugin for Claude Code",
+  "owner": {
+    "name": "jared",
+    "url": "https://github.com/jared"
+  },
+  "plugins": [
+    {
+      "name": "coderlm",
+      "source": "./",
+      "description": "Code retrieval server with tree-sitter indexing, cross-file callers, test discovery, and scope-aware grep",
+      "version": "0.1.0"
+    }
+  ]
+}

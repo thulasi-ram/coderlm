@@ -10,7 +10,12 @@ CoderLM applies the Recursive Language Model (RLM) pattern to codebases. A Rust 
 
 - `server/` — Rust codebase (the only code that gets built). Has its own `.git`.
 - `.claude/skills/coderlm/` — Claude Code skill definition + Python CLI wrapper
-- `.claude/agents/coderlm-subcall.md` — Sub-agent (Haiku) for delegated code analysis
+- `.claude/agents/` — Tiered sub-agents: `coderlm-scout` (Haiku, quick lookups), `coderlm-analyst` (Sonnet, multi-file tracing), `coderlm-architect` (Opus, architectural reasoning)
+- `.claude-plugin/` — Plugin manifest for `claude plugin install .`
+- `hooks/` — Claude Code hooks (SessionStart, UserPromptSubmit)
+- `commands/` — Slash command definitions
+- `scripts/` — Daemon management and hook scripts
+- `rlm-claude-code/` — Reference RLM plugin (Python/Go, for comparison)
 - `modal_repl.py` — Original RLM research implementation (reference only)
 - `brainqub3/` — Earlier document-focused RLM approach (reference only)
 
@@ -58,11 +63,12 @@ The server is a single-binary axum application. Key modules under `server/src/`:
   - `mod.rs` — `SymbolTable` with DashMap primary store keyed by `"file::name"` and secondary indices by name and file
   - `symbol.rs` — `Symbol` struct and `SymbolKind` enum
   - `parser.rs` — Runs tree-sitter on files, dispatches to per-language queries
-  - `queries/` — Tree-sitter query strings for Rust, Python, TypeScript, Go (JS reuses TS)
+  - `queries/` — Tree-sitter query strings per language: symbols, callers (call-expression), variables (local bindings) for Rust, Python, TypeScript, Go (JS reuses TS base)
 - **`ops/`** — Business logic called by route handlers
   - `structure.rs` — File tree rendering, define/redefine/mark
-  - `symbol_ops.rs` — Symbol list/search/implementation/callers/tests/variables
-  - `content.rs` — peek, grep, chunk_indices
+  - `symbol_ops.rs` — Symbol list/search/implementation/callers (AST-aware)/tests/variables (AST-aware)
+  - `content.rs` — peek, grep (with scope-aware filtering), chunk_indices
+  - `annotations.rs` — Save/load annotations to/from JSON on disk
   - `history.rs` — Session history retrieval
 - **`config.rs`** — Hardcoded ignore patterns and max file size constant
 
@@ -71,18 +77,11 @@ The server is a single-binary axum application. Key modules under `server/src/`:
 1. `POST /sessions` with `{"cwd": "..."}` → `AppState::get_or_create_project()` scans the directory synchronously, then spawns background symbol extraction via `parser::extract_all_symbols()`
 2. All subsequent requests include `X-Session-Id` header → `require_project()` resolves session to project
 3. Filesystem watcher detects changes → re-scans affected files and re-extracts symbols
-4. Annotations (definitions, marks) are in-memory only — lost on server restart
+4. Annotations (definitions, marks) are in-memory with optional persistence — `POST /annotations/save` writes to `.coderlm/annotations.json` in the project root, and annotations are auto-loaded on session creation
 
 ### Concurrency model
 
 All shared state uses `DashMap` (lock-free concurrent hashmap). The `Project.last_active` timestamp uses `parking_lot::Mutex`. Multiple sessions can read/annotate the same project concurrently. Symbol extraction runs on `tokio::spawn`, grep runs on `tokio::task::spawn_blocking`.
-
-## Rust-Specific Gotchas
-
-- **Edition 2021** (not 2024) — `cargo init` on newer rustc defaults to 2024, which breaks some dependencies.
-- **tree-sitter 0.24** uses `StreamingIterator` from the `streaming-iterator` crate, not `std::iter::Iterator`. Pattern: `while let Some(m) = matches.next()`.
-- **`notify-debouncer-mini` 0.5** — `DebouncedEventKind` is non-exhaustive; match arms need `_ => {}`.
-- tree-sitter language crates are at 0.23 (one minor behind tree-sitter itself).
 
 ## API
 
@@ -96,7 +95,7 @@ The skill wraps the API with a Python CLI (no external dependencies):
 python3 .claude/skills/coderlm/scripts/coderlm_cli.py <command> [args]
 ```
 
-Session state cached in `.claude/coderlm_state/session.json`. The CLI must be run from the project root that was indexed. Key commands: `init`, `structure`, `symbols`, `search`, `impl`, `callers`, `tests`, `grep`, `peek`, `cleanup`. Full reference in `.claude/skills/coderlm/references/api-reference.md`.
+Session state cached in `.claude/coderlm_state/session.json`. The CLI must be run from the project root that was indexed. Key commands: `init`, `structure`, `symbols`, `search`, `impl`, `callers`, `tests`, `grep` (with `--scope code`), `peek`, `save-annotations`, `load-annotations`, `cleanup`. Full reference in `.claude/skills/coderlm/references/api-reference.md`.
 
 ## Workflow: Codebase Exploration
 

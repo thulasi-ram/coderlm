@@ -21,6 +21,10 @@ pub fn get_language_config(lang: Language) -> Option<LanguageConfig> {
 pub struct LanguageConfig {
     pub language: tree_sitter::Language,
     pub symbols_query: &'static str,
+    /// Tree-sitter query for call expressions. Captures `@callee` for the called name.
+    pub callers_query: &'static str,
+    /// Tree-sitter query for local variable bindings. Captures `@var.name`.
+    pub variables_query: &'static str,
     pub test_patterns: Vec<TestPattern>,
 }
 

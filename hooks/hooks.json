@@ -1,0 +1,54 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.sh\"",
+            "timeout": 10000,
+            "description": "Check if coderlm-server is running, auto-create session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You have coderlm available for precise codebase exploration. When navigating unfamiliar code, understanding cross-file dependencies, or retrieving specific implementations, use /coderlm instead of glob/grep/read. It provides tree-sitter-backed symbol extraction, cross-file caller detection, test discovery, and scope-aware grep.",
+            "description": "Guide Claude to use coderlm for code exploration"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Before compaction, save any coderlm annotations you've made during this session. Run: python3 .claude/skills/coderlm/scripts/coderlm_cli.py save-annotations — this persists file definitions, marks, and symbol definitions to disk so they survive context compaction and future sessions.",
+            "description": "Remind Claude to persist coderlm annotations before compaction"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-stop.sh\"",
+            "timeout": 5000,
+            "description": "Save annotations and clean up coderlm session"
+          }
+        ]
+      }
+    ]
+  }
+}

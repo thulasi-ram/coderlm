@@ -70,8 +70,21 @@ python3 cli peek src/main.rs [--start 0] [--end 50]
 # Regex search across all indexed files
 python3 cli grep "DashMap" [--max-matches 50] [--context-lines 2]
 
+# Scope-aware grep: only match in code (skip comments and strings)
+python3 cli grep "DashMap" --scope code
+
 # Compute byte-range chunks for a file
 python3 cli chunks src/main.rs [--size 5000] [--overlap 200]
+```
+
+### Annotations
+
+```bash
+# Save annotations (definitions + marks) to .coderlm/annotations.json
+python3 cli save-annotations
+
+# Load annotations from disk (auto-loaded on session creation)
+python3 cli load-annotations
 ```
 
 ### History
@@ -215,6 +228,7 @@ Same shape as symbols response.
 | Python     | `.py`, `.pyi`                 |
 | TypeScript | `.ts`, `.tsx`                 |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Go         | `.go`                         |
 
 All other file types appear in the file tree and are searchable via peek/grep, but do not produce symbols.
 
