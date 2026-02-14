@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::StreamingIterator;
@@ -168,12 +169,13 @@ pub fn extract_symbols_from_file(
     Ok(symbols)
 }
 
-/// Extract symbols from all files in the tree. Runs on blocking threads
-/// with bounded concurrency.
+/// Extract symbols from all files in the tree (or a subset if `only_files` is provided).
+/// Runs on blocking threads with bounded concurrency.
 pub async fn extract_all_symbols(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    only_files: Option<HashSet<String>>,
 ) -> Result<usize> {
     let root = root.to_path_buf();
     let file_tree = file_tree.clone();
@@ -186,10 +188,20 @@ pub async fn extract_all_symbols(
             .files
             .iter()
             .filter(|e| e.value().language.has_tree_sitter_support())
+            .filter(|e| {
+                only_files
+                    .as_ref()
+                    .map_or(true, |set| set.contains(e.key().as_str()))
+            })
             .map(|e| (e.key().clone(), e.value().language))
             .collect();
 
         for (rel_path, language) in paths {
+            // Remove stale symbols for files being re-extracted
+            if only_files.is_some() {
+                symbol_table.remove_file(&rel_path);
+            }
+
             match extract_symbols_from_file(&root, &rel_path, language) {
                 Ok(symbols) => {
                     let count = symbols.len();

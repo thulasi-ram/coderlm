@@ -92,6 +92,7 @@ async fn run_server(
     }
 
     // Build router
+    let state_for_shutdown = state.clone();
     let app = server::build_router(state);
 
     let addr = format!("{}:{}", bind, port);
@@ -103,7 +104,16 @@ async fn run_server(
         info!("coderlm server listening on http://{} (no project pre-indexed)", addr);
     }
 
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: save all indexes on ctrl-c
+    let shutdown_state = state_for_shutdown.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutting down — saving indexes...");
+            shutdown_state.save_all_indexes();
+            info!("Indexes saved. Goodbye.");
+        })
+        .await?;
 
     Ok(())
 }

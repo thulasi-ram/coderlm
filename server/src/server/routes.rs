@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::ops::{annotations, content, history, structure, symbol_ops};
+use crate::ops::{annotations, cache, content, history, structure, symbol_ops};
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::server::state::{AppState, Project};
@@ -86,6 +86,9 @@ pub fn build_routes(state: AppState) -> Router {
         // Annotations
         .route("/api/v1/annotations/save", post(save_annotations))
         .route("/api/v1/annotations/load", post(load_annotations))
+        // Index cache
+        .route("/api/v1/index/save", post(save_index))
+        .route("/api/v1/index/load", post(load_index))
         .with_state(state)
 }
 
@@ -672,4 +675,46 @@ async fn load_annotations(
     });
     record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/load", "loaded");
     Ok(Json(json!({ "ok": true, "loaded": summary })))
+}
+
+// ---------------------------------------------------------------------------
+// Index Cache
+// ---------------------------------------------------------------------------
+
+async fn save_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    cache::save_index(&project.root, &project.file_tree, &project.symbol_table)
+        .map_err(AppError::Internal)?;
+    record_history(&state, session_id(&headers).as_deref(), "POST", "/index/save", "saved");
+    Ok(Json(json!({
+        "ok": true,
+        "files": project.file_tree.len(),
+        "symbols": project.symbol_table.len(),
+    })))
+}
+
+async fn load_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    let stats = cache::load_index(
+        &project.root,
+        &project.file_tree,
+        &project.symbol_table,
+        state.inner.max_file_size,
+    )
+    .map_err(AppError::Internal)?;
+    record_history(&state, session_id(&headers).as_deref(), "POST", "/index/load", "loaded");
+    Ok(Json(json!({
+        "ok": true,
+        "cached": stats.cached,
+        "changed": stats.changed,
+        "new": stats.new,
+        "deleted": stats.deleted,
+        "files_to_extract": stats.files_to_extract.len(),
+    })))
 }

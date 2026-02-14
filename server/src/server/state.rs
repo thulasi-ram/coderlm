@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use tracing::info;
 
 use crate::index::file_tree::FileTree;
 use crate::index::{walker, watcher};
+use crate::ops::cache;
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::symbols::{parser, SymbolTable};
@@ -48,7 +50,8 @@ impl AppState {
         }
     }
 
-    /// Look up an existing project or index a new one. Evicts LRU if at capacity.
+    /// Look up an existing project or index a new one. Tries to load from
+    /// cache first; falls back to full scan + extraction. Evicts LRU if at capacity.
     pub fn get_or_create_project(&self, cwd: &Path) -> Result<Arc<Project>, AppError> {
         let canonical = cwd.canonicalize().map_err(|e| {
             AppError::BadRequest(format!("Path not accessible: {}", e))
@@ -72,16 +75,46 @@ impl AppState {
             self.evict_lru()?;
         }
 
-        // Scan directory
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
         let max_file_size = self.inner.max_file_size;
 
-        info!("Indexing new project: {}", canonical.display());
-        let file_count =
-            walker::scan_directory(&canonical, &file_tree, max_file_size)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-        info!("Indexed {} files for {}", file_count, canonical.display());
+        // Try loading from cache first
+        let files_to_extract = match cache::load_index(
+            &canonical,
+            &file_tree,
+            &symbol_table,
+            max_file_size,
+        ) {
+            Ok(stats) => {
+                info!(
+                    "Loaded project from cache: {} (cached={}, changed={}, new={}, deleted={})",
+                    canonical.display(),
+                    stats.cached,
+                    stats.changed,
+                    stats.new,
+                    stats.deleted
+                );
+                if stats.files_to_extract.is_empty() {
+                    None
+                } else {
+                    Some(stats.files_to_extract)
+                }
+            }
+            Err(reason) => {
+                info!(
+                    "No usable cache for {}: {}. Doing full index.",
+                    canonical.display(),
+                    reason
+                );
+                let file_count =
+                    walker::scan_directory(&canonical, &file_tree, max_file_size)
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                info!("Indexed {} files for {}", file_count, canonical.display());
+                // None means extract ALL files
+                None
+            }
+        };
 
         // Start watcher
         let watcher_handle = watcher::start_watcher(
@@ -106,9 +139,11 @@ impl AppState {
         let ft = file_tree;
         let st = symbol_table;
         let root = project.root.clone();
+        let only_files = files_to_extract.map(|v| v.into_iter().collect::<HashSet<String>>());
         tokio::spawn(async move {
-            info!("Starting symbol extraction for {}...", root.display());
-            match parser::extract_all_symbols(&root, &ft, &st).await {
+            let scope = if only_files.is_some() { "incremental" } else { "full" };
+            info!("Starting {} symbol extraction for {}...", scope, root.display());
+            match parser::extract_all_symbols(&root, &ft, &st, only_files).await {
                 Ok(count) => info!("Extracted {} symbols for {}", count, root.display()),
                 Err(e) => tracing::error!("Symbol extraction failed for {}: {}", root.display(), e),
             }
@@ -150,7 +185,8 @@ impl AppState {
         }
     }
 
-    /// Evict the least recently used project. Removes all sessions pointing to it.
+    /// Evict the least recently used project. Saves its index to disk first,
+    /// then removes all sessions pointing to it.
     fn evict_lru(&self) -> Result<(), AppError> {
         // Find the project with the oldest last_active
         let oldest = self
@@ -164,6 +200,13 @@ impl AppState {
             AppError::Internal("No projects to evict".into())
         })?;
 
+        // Save index before evicting
+        if let Some(project) = self.inner.projects.get(&path) {
+            if let Err(e) = cache::save_index(&project.root, &project.file_tree, &project.symbol_table) {
+                tracing::warn!("Failed to save index before eviction for {}: {}", path.display(), e);
+            }
+        }
+
         info!("Evicting project: {}", path.display());
 
         // Remove the project (drops watcher)
@@ -173,5 +216,15 @@ impl AppState {
         self.inner.sessions.retain(|_, session| session.project_path != path);
 
         Ok(())
+    }
+
+    /// Save indexes for all currently loaded projects. Called on graceful shutdown.
+    pub fn save_all_indexes(&self) {
+        for entry in self.inner.projects.iter() {
+            let project = entry.value();
+            if let Err(e) = cache::save_index(&project.root, &project.file_tree, &project.symbol_table) {
+                tracing::warn!("Failed to save index for {}: {}", project.root.display(), e);
+            }
+        }
     }
 }
