@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tracing::info;
 
+use crate::git::github;
 use crate::index::file_tree::FileTree;
 use crate::index::walker;
 use crate::ops::cache;
@@ -33,16 +34,25 @@ pub struct AppStateInner {
     pub sessions: DashMap<String, Session>,
     pub max_projects: usize,
     pub max_file_size: u64,
+    pub repos_dir: PathBuf,
+    pub cache_base: Option<PathBuf>,
 }
 
 impl AppState {
-    pub fn new(max_projects: usize, max_file_size: u64) -> Self {
+    pub fn new(
+        max_projects: usize,
+        max_file_size: u64,
+        repos_dir: PathBuf,
+        cache_base: Option<PathBuf>,
+    ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 projects: DashMap::new(),
                 sessions: DashMap::new(),
                 max_projects,
                 max_file_size,
+                repos_dir,
+                cache_base,
             }),
         }
     }
@@ -75,6 +85,7 @@ impl AppState {
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
         let max_file_size = self.inner.max_file_size;
+        let cache_base = &self.inner.cache_base;
 
         // Try loading from cache first
         let files_to_extract = match cache::load_index(
@@ -82,6 +93,7 @@ impl AppState {
             &file_tree,
             &symbol_table,
             max_file_size,
+            cache_base,
         ) {
             Ok(stats) => {
                 info!(
@@ -127,16 +139,90 @@ impl AppState {
         let st = symbol_table;
         let root = project.root.clone();
         let only_files = files_to_extract.map(|v| v.into_iter().collect::<HashSet<String>>());
+        let cb = cache_base.clone();
         tokio::spawn(async move {
             let scope = if only_files.is_some() { "incremental" } else { "full" };
             info!("Starting {} symbol extraction for {}...", scope, root.display());
-            match parser::extract_all_symbols(&root, &ft, &st, only_files).await {
+            match parser::extract_all_symbols(&root, &ft, &st, only_files, cb).await {
                 Ok(count) => info!("Extracted {} symbols for {}", count, root.display()),
                 Err(e) => tracing::error!("Symbol extraction failed for {}: {}", root.display(), e),
             }
         });
 
         Ok(project)
+    }
+
+    /// Clone a GitHub repo and index it. Returns the project and (org, repo).
+    pub fn clone_and_index(&self, repo_url: &str) -> Result<(Arc<Project>, String, String), AppError> {
+        let (org, repo) = github::parse_github_url(repo_url)
+            .map_err(AppError::BadRequest)?;
+
+        let target = self.inner.repos_dir.join(&org).join(&repo);
+
+        // Clone if not already present
+        if !target.exists() || !github::is_git_repo(&target) {
+            github::clone_repo(repo_url, &target)
+                .map_err(AppError::Internal)?;
+        }
+
+        let project = self.get_or_create_project(&target)?;
+        Ok((project, org, repo))
+    }
+
+    /// Pull and reindex all projects that live under `repos_dir`.
+    pub fn refresh_all_projects(&self) {
+        let repos_dir = &self.inner.repos_dir;
+        let cache_base = &self.inner.cache_base;
+        let max_file_size = self.inner.max_file_size;
+
+        for entry in self.inner.projects.iter() {
+            let project = entry.value();
+            let root = &project.root;
+
+            // Only pull projects that are inside repos_dir
+            if !root.starts_with(repos_dir) {
+                continue;
+            }
+
+            if !github::is_git_repo(root) {
+                continue;
+            }
+
+            match github::pull_repo(root) {
+                Ok(true) => {
+                    info!("Changes detected in {}, reindexing...", root.display());
+                    match cache::reindex(
+                        root,
+                        &project.file_tree,
+                        &project.symbol_table,
+                        max_file_size,
+                        cache_base,
+                    ) {
+                        Ok(stats) => {
+                            if !stats.files_to_extract.is_empty() {
+                                let ft = project.file_tree.clone();
+                                let st = project.symbol_table.clone();
+                                let r = root.clone();
+                                let only: HashSet<String> = stats.files_to_extract.into_iter().collect();
+                                let cb = cache_base.clone();
+                                tokio::spawn(async move {
+                                    let _ = parser::extract_all_symbols(&r, &ft, &st, Some(only), cb).await;
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Reindex failed for {}: {}", root.display(), e);
+                        }
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!("No changes in {}", root.display());
+                }
+                Err(e) => {
+                    tracing::warn!("Git pull failed for {}: {}", root.display(), e);
+                }
+            }
+        }
     }
 
     /// Look up the project for a given session. Returns a descriptive error if
@@ -189,7 +275,12 @@ impl AppState {
 
         // Save index before evicting
         if let Some(project) = self.inner.projects.get(&path) {
-            if let Err(e) = cache::save_index(&project.root, &project.file_tree, &project.symbol_table) {
+            if let Err(e) = cache::save_index(
+                &project.root,
+                &project.file_tree,
+                &project.symbol_table,
+                &self.inner.cache_base,
+            ) {
                 tracing::warn!("Failed to save index before eviction for {}: {}", path.display(), e);
             }
         }
@@ -208,7 +299,12 @@ impl AppState {
     pub fn save_all_indexes(&self) {
         for entry in self.inner.projects.iter() {
             let project = entry.value();
-            if let Err(e) = cache::save_index(&project.root, &project.file_tree, &project.symbol_table) {
+            if let Err(e) = cache::save_index(
+                &project.root,
+                &project.file_tree,
+                &project.symbol_table,
+                &self.inner.cache_base,
+            ) {
                 tracing::warn!("Failed to save index for {}: {}", project.root.display(), e);
             }
         }

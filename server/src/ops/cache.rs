@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -12,8 +12,9 @@ use crate::index::walker;
 use crate::symbols::symbol::Symbol;
 use crate::symbols::SymbolTable;
 
-const CACHE_DIR: &str = ".coderlm/cache";
-const MANIFEST_FILE: &str = ".coderlm/manifest.bin";
+const CACHE_DIR: &str = "cache";
+const MANIFEST_FILE: &str = "manifest.bin";
+const CODERLM_DIR: &str = ".coderlm";
 const CACHE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
@@ -49,17 +50,44 @@ pub struct CacheLoadStats {
 }
 
 // ---------------------------------------------------------------------------
+// Cache root resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the cache root directory for a project.
+///
+/// - If `cache_base` is `None`: returns `<project_root>/.coderlm/` (default, in-project)
+/// - If `Some(base)`: returns `<base>/<hash-of-project-root>/` (external cache dir)
+pub fn resolve_cache_root(project_root: &Path, cache_base: &Option<PathBuf>) -> PathBuf {
+    match cache_base {
+        None => project_root.join(CODERLM_DIR),
+        Some(base) => {
+            let hash = stable_path_hash(project_root);
+            base.join(hash)
+        }
+    }
+}
+
+/// Produce a stable, filesystem-safe hash of a path.
+fn stable_path_hash(path: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    path.to_string_lossy().as_ref().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+// ---------------------------------------------------------------------------
 // Per-file cache helpers (public — used by parser.rs)
 // ---------------------------------------------------------------------------
 
-/// Cache path for a single file: `.coderlm/cache/<rel_path>.bin`
-fn file_cache_path(root: &Path, rel_path: &str) -> std::path::PathBuf {
-    root.join(CACHE_DIR).join(format!("{}.bin", rel_path))
+/// Cache path for a single file: `<cache_root>/cache/<rel_path>.bin`
+fn file_cache_path(cache_root: &Path, rel_path: &str) -> PathBuf {
+    cache_root.join(CACHE_DIR).join(format!("{}.bin", rel_path))
 }
 
 /// Save a single file's cache entry to disk.
 pub fn save_file_cache(
-    root: &Path,
+    cache_root: &Path,
     file_entry: &FileEntry,
     symbols: &[Symbol],
 ) -> Result<(), String> {
@@ -67,7 +95,7 @@ pub fn save_file_cache(
         file_entry: file_entry.clone(),
         symbols: symbols.to_vec(),
     };
-    let path = file_cache_path(root, &file_entry.rel_path);
+    let path = file_cache_path(cache_root, &file_entry.rel_path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create cache dir: {}", e))?;
@@ -80,8 +108,8 @@ pub fn save_file_cache(
 }
 
 /// Load a single file's cache entry from disk.
-fn load_file_cache(root: &Path, rel_path: &str) -> Result<FileCacheEntry, String> {
-    let path = file_cache_path(root, rel_path);
+fn load_file_cache(cache_root: &Path, rel_path: &str) -> Result<FileCacheEntry, String> {
+    let path = file_cache_path(cache_root, rel_path);
     let bytes = std::fs::read(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
     bincode::deserialize(&bytes)
@@ -89,14 +117,14 @@ fn load_file_cache(root: &Path, rel_path: &str) -> Result<FileCacheEntry, String
 }
 
 /// Delete a single file's cache entry from disk.
-fn delete_file_cache(root: &Path, rel_path: &str) {
-    let path = file_cache_path(root, rel_path);
+fn delete_file_cache(cache_root: &Path, rel_path: &str) {
+    let path = file_cache_path(cache_root, rel_path);
     let _ = std::fs::remove_file(&path);
 }
 
 /// Save the manifest to disk.
-fn save_manifest(root: &Path, manifest: &Manifest) -> Result<(), String> {
-    let path = root.join(MANIFEST_FILE);
+fn save_manifest(cache_root: &Path, manifest: &Manifest) -> Result<(), String> {
+    let path = cache_root.join(MANIFEST_FILE);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create manifest dir: {}", e))?;
@@ -109,8 +137,8 @@ fn save_manifest(root: &Path, manifest: &Manifest) -> Result<(), String> {
 }
 
 /// Load the manifest from disk.
-fn load_manifest(root: &Path) -> Result<Manifest, String> {
-    let path = root.join(MANIFEST_FILE);
+fn load_manifest(cache_root: &Path) -> Result<Manifest, String> {
+    let path = cache_root.join(MANIFEST_FILE);
     if !path.exists() {
         return Err("No manifest found".into());
     }
@@ -128,7 +156,7 @@ fn load_manifest(root: &Path) -> Result<Manifest, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Public API (same signatures as before)
+// Public API
 // ---------------------------------------------------------------------------
 
 /// Save the current file tree and symbol table as per-file cache entries.
@@ -136,8 +164,10 @@ pub fn save_index(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    cache_base: &Option<PathBuf>,
 ) -> Result<(), String> {
-    let cache_dir = root.join(CACHE_DIR);
+    let cache_root = resolve_cache_root(root, cache_base);
+    let cache_dir = cache_root.join(CACHE_DIR);
     std::fs::create_dir_all(&cache_dir)
         .map_err(|e| format!("Failed to create cache dir: {}", e))?;
 
@@ -154,7 +184,7 @@ pub fn save_index(
         // Collect symbols for this file
         let symbols = symbol_table.list_by_file(&rel_path);
 
-        if let Err(e) = save_file_cache(root, &file_entry, &symbols) {
+        if let Err(e) = save_file_cache(&cache_root, &file_entry, &symbols) {
             warn!("Failed to save cache for {}: {}", rel_path, e);
             continue;
         }
@@ -169,7 +199,7 @@ pub fn save_index(
         saved += 1;
     }
 
-    save_manifest(root, &manifest)?;
+    save_manifest(&cache_root, &manifest)?;
 
     info!(
         "Saved per-file cache: {} files, {} symbols",
@@ -188,8 +218,10 @@ pub fn load_index(
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
     max_file_size: u64,
+    cache_base: &Option<PathBuf>,
 ) -> Result<CacheLoadStats, String> {
-    let manifest = load_manifest(root)?;
+    let cache_root = resolve_cache_root(root, cache_base);
+    let manifest = load_manifest(&cache_root)?;
 
     // Do a fresh filesystem scan to get current state
     let fresh_tree = Arc::new(FileTree::new());
@@ -218,7 +250,7 @@ pub fn load_index(
                 && manifest_entry.size == fresh_entry.size
             {
                 // Unchanged — load from per-file cache
-                match load_file_cache(root, &rel_path) {
+                match load_file_cache(&cache_root, &rel_path) {
                     Ok(cached) => {
                         file_tree.insert(cached.file_entry);
                         for sym in cached.symbols {
@@ -254,7 +286,7 @@ pub fn load_index(
     for path in &manifest_paths {
         if !fresh_paths.contains(path) {
             stats.deleted += 1;
-            delete_file_cache(root, path);
+            delete_file_cache(&cache_root, path);
             debug!("Deleted file: {}", path);
         }
     }
@@ -279,7 +311,10 @@ pub fn reindex(
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
     max_file_size: u64,
+    cache_base: &Option<PathBuf>,
 ) -> Result<CacheLoadStats, String> {
+    let cache_root = resolve_cache_root(root, cache_base);
+
     // Fresh filesystem scan
     let fresh_tree = Arc::new(FileTree::new());
     walker::scan_directory(root, &fresh_tree, max_file_size)
@@ -331,7 +366,7 @@ pub fn reindex(
         if !fresh_paths.contains(path) {
             file_tree.remove(path);
             symbol_table.remove_file(path);
-            delete_file_cache(root, path);
+            delete_file_cache(&cache_root, path);
             stats.deleted += 1;
             debug!("Deleted file: {}", path);
         }
@@ -351,7 +386,7 @@ pub fn reindex(
             },
         );
     }
-    if let Err(e) = save_manifest(root, &manifest) {
+    if let Err(e) = save_manifest(&cache_root, &manifest) {
         warn!("Failed to save manifest after reindex: {}", e);
     }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -7,9 +7,10 @@ use tracing::{debug, warn};
 
 use crate::index::file_entry::FileMark;
 use crate::index::file_tree::FileTree;
+use crate::ops::cache;
 use crate::symbols::SymbolTable;
 
-const ANNOTATIONS_FILE: &str = ".coderlm/annotations.json";
+const ANNOTATIONS_FILE: &str = "annotations.json";
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AnnotationData {
@@ -25,11 +26,12 @@ pub struct AnnotationData {
 }
 
 /// Save all annotations (file definitions, marks, symbol definitions)
-/// to `.coderlm/annotations.json` in the project root.
+/// to `<cache_root>/annotations.json`.
 pub fn save_annotations(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    cache_base: &Option<PathBuf>,
 ) -> Result<(), String> {
     let mut data = AnnotationData::default();
 
@@ -59,7 +61,8 @@ pub fn save_annotations(
         }
     }
 
-    let annotations_path = root.join(ANNOTATIONS_FILE);
+    let cache_root = cache::resolve_cache_root(root, cache_base);
+    let annotations_path = cache_root.join(ANNOTATIONS_FILE);
     if let Some(parent) = annotations_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create annotations dir: {}", e))?;
@@ -80,14 +83,16 @@ pub fn save_annotations(
     Ok(())
 }
 
-/// Load annotations from `.coderlm/annotations.json` and apply them
+/// Load annotations from `<cache_root>/annotations.json` and apply them
 /// to the file tree and symbol table.
 pub fn load_annotations(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    cache_base: &Option<PathBuf>,
 ) -> Result<AnnotationData, String> {
-    let annotations_path = root.join(ANNOTATIONS_FILE);
+    let cache_root = cache::resolve_cache_root(root, cache_base);
+    let annotations_path = cache_root.join(ANNOTATIONS_FILE);
     if !annotations_path.exists() {
         return Ok(AnnotationData::default());
     }

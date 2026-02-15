@@ -1,4 +1,5 @@
 mod config;
+mod git;
 mod index;
 mod ops;
 mod server;
@@ -41,6 +42,18 @@ enum Commands {
         /// Maximum number of concurrent indexed projects
         #[arg(long, default_value = "5")]
         max_projects: usize,
+
+        /// Directory to clone repos into
+        #[arg(long, default_value = "./repos")]
+        repos_dir: PathBuf,
+
+        /// Directory to store index cache (default: .coderlm inside each project)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+
+        /// Interval in seconds for periodic git pull + reindex (0 = disabled)
+        #[arg(long, default_value = "3600")]
+        refresh_interval: u64,
     },
 }
 
@@ -65,8 +78,11 @@ async fn main() -> anyhow::Result<()> {
             bind,
             max_file_size,
             max_projects,
+            repos_dir,
+            cache_dir,
+            refresh_interval,
         } => {
-            run_server(path, port, bind, max_file_size, max_projects).await?;
+            run_server(path, port, bind, max_file_size, max_projects, repos_dir, cache_dir, refresh_interval).await?;
         }
     }
 
@@ -79,9 +95,32 @@ async fn run_server(
     bind: String,
     max_file_size: u64,
     max_projects: usize,
+    repos_dir: PathBuf,
+    cache_dir: Option<PathBuf>,
+    refresh_interval: u64,
 ) -> anyhow::Result<()> {
+    // Ensure repos_dir exists
+    std::fs::create_dir_all(&repos_dir)?;
+    let repos_dir = repos_dir.canonicalize()?;
+
+    // Ensure cache_dir exists if specified
+    let cache_base = if let Some(ref dir) = cache_dir {
+        std::fs::create_dir_all(dir)?;
+        Some(dir.canonicalize()?)
+    } else {
+        None
+    };
+
+    info!("Repos dir: {}", repos_dir.display());
+    if let Some(ref cb) = cache_base {
+        info!("Cache dir: {}", cb.display());
+    }
+    if refresh_interval > 0 {
+        info!("Refresh interval: {}s", refresh_interval);
+    }
+
     // Create shared state
-    let state = AppState::new(max_projects, max_file_size);
+    let state = AppState::new(max_projects, max_file_size, repos_dir, cache_base);
 
     // If an initial path was provided, pre-index it
     if let Some(ref p) = path {
@@ -89,6 +128,20 @@ async fn run_server(
         state.get_or_create_project(p).map_err(|e| {
             anyhow::anyhow!("Failed to index '{}': {}", p.display(), e)
         })?;
+    }
+
+    // Spawn periodic refresh loop
+    if refresh_interval > 0 {
+        let refresh_state = state.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(refresh_interval);
+            loop {
+                tokio::time::sleep(interval).await;
+                info!("Running periodic refresh...");
+                refresh_state.refresh_all_projects();
+                info!("Periodic refresh complete.");
+            }
+        });
     }
 
     // Build router

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::StreamingIterator;
 use tracing::{debug, warn};
@@ -177,12 +177,14 @@ pub async fn extract_all_symbols(
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
     only_files: Option<HashSet<String>>,
+    cache_base: Option<PathBuf>,
 ) -> Result<usize> {
     let root = root.to_path_buf();
     let file_tree = file_tree.clone();
     let symbol_table = symbol_table.clone();
 
     let count = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let cache_root = cache::resolve_cache_root(&root, &cache_base);
         let mut total = 0;
 
         let paths: Vec<(String, Language)> = file_tree
@@ -213,7 +215,7 @@ pub async fn extract_all_symbols(
                     if let Some(mut entry) = file_tree.files.get_mut(&rel_path) {
                         entry.symbols_extracted = true;
                         // Save per-file cache immediately (crash-safe)
-                        if let Err(e) = cache::save_file_cache(&root, &entry, &symbols) {
+                        if let Err(e) = cache::save_file_cache(&cache_root, &entry, &symbols) {
                             debug!("Failed to cache {}: {}", rel_path, e);
                         }
                     }

@@ -65,6 +65,8 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(get_session))
         .route("/api/v1/sessions/{id}", delete(delete_session))
+        // Projects
+        .route("/api/v1/projects/clone", post(clone_project))
         // Structure
         .route("/api/v1/structure", get(get_structure))
         .route("/api/v1/structure/define", post(define_file))
@@ -169,10 +171,11 @@ async fn create_session(
     let ft = project.file_tree.clone();
     let st = project.symbol_table.clone();
     let root = project.root.clone();
+    let cache_base = state.inner.cache_base.clone();
     tokio::spawn(async move {
         // Small delay to let symbol extraction start first
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = annotations::load_annotations(&root, &ft, &st);
+        let _ = annotations::load_annotations(&root, &ft, &st, &cache_base);
     });
 
     Ok(Json(json!({
@@ -243,6 +246,46 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     });
 
     Json(json!({ "sessions": sessions, "count": sessions.len() }))
+}
+
+// ---------------------------------------------------------------------------
+// Projects: clone
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CloneProjectBody {
+    repo_url: String,
+}
+
+async fn clone_project(
+    State(state): State<AppState>,
+    Json(body): Json<CloneProjectBody>,
+) -> Result<Json<Value>, AppError> {
+    let (project, org, repo) = state.clone_and_index(&body.repo_url)?;
+
+    // Create a session automatically
+    let id = uuid::Uuid::new_v4().to_string();
+    let session = Session::new(id.clone(), project.root.clone());
+    let created_at = session.created_at;
+    state.inner.sessions.insert(id.clone(), session);
+
+    // Load annotations
+    let ft = project.file_tree.clone();
+    let st = project.symbol_table.clone();
+    let root = project.root.clone();
+    let cache_base = state.inner.cache_base.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = annotations::load_annotations(&root, &ft, &st, &cache_base);
+    });
+
+    Ok(Json(json!({
+        "session_id": id,
+        "created_at": created_at.to_rfc3339(),
+        "project": project.root.display().to_string(),
+        "org": org,
+        "repo": repo,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -655,8 +698,13 @@ async fn save_annotations(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
-    annotations::save_annotations(&project.root, &project.file_tree, &project.symbol_table)
-        .map_err(AppError::Internal)?;
+    annotations::save_annotations(
+        &project.root,
+        &project.file_tree,
+        &project.symbol_table,
+        &state.inner.cache_base,
+    )
+    .map_err(AppError::Internal)?;
     record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/save", "saved");
     Ok(Json(json!({ "ok": true })))
 }
@@ -670,6 +718,7 @@ async fn load_annotations(
         &project.root,
         &project.file_tree,
         &project.symbol_table,
+        &state.inner.cache_base,
     )
     .map_err(AppError::Internal)?;
     let summary = json!({
@@ -690,8 +739,13 @@ async fn save_index(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
-    cache::save_index(&project.root, &project.file_tree, &project.symbol_table)
-        .map_err(AppError::Internal)?;
+    cache::save_index(
+        &project.root,
+        &project.file_tree,
+        &project.symbol_table,
+        &state.inner.cache_base,
+    )
+    .map_err(AppError::Internal)?;
     record_history(&state, session_id(&headers).as_deref(), "POST", "/index/save", "saved");
     Ok(Json(json!({
         "ok": true,
@@ -710,6 +764,7 @@ async fn load_index(
         &project.file_tree,
         &project.symbol_table,
         state.inner.max_file_size,
+        &state.inner.cache_base,
     )
     .map_err(AppError::Internal)?;
     record_history(&state, session_id(&headers).as_deref(), "POST", "/index/load", "loaded");
@@ -737,6 +792,7 @@ async fn reindex(
         &project.file_tree,
         &project.symbol_table,
         state.inner.max_file_size,
+        &state.inner.cache_base,
     )
     .map_err(AppError::Internal)?;
 
@@ -752,9 +808,10 @@ async fn reindex(
         let st = project.symbol_table.clone();
         let root = project.root.clone();
         let only_files: HashSet<String> = stats.files_to_extract.into_iter().collect();
+        let cache_base = state.inner.cache_base.clone();
         tokio::spawn(async move {
             tracing::info!("Starting incremental symbol extraction for {}...", root.display());
-            match parser::extract_all_symbols(&root, &ft, &st, Some(only_files)).await {
+            match parser::extract_all_symbols(&root, &ft, &st, Some(only_files), cache_base).await {
                 Ok(count) => tracing::info!("Extracted {} symbols for {}", count, root.display()),
                 Err(e) => tracing::error!("Symbol extraction failed for {}: {}", root.display(), e),
             }
