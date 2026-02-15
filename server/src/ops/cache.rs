@@ -223,3 +223,80 @@ pub fn load_index(
 
     Ok(stats)
 }
+
+/// Re-index a live project by diffing the in-memory FileTree against a fresh
+/// filesystem scan. Updates the file tree in place and returns stats + a list
+/// of files needing symbol re-extraction.
+pub fn reindex(
+    root: &Path,
+    file_tree: &Arc<FileTree>,
+    symbol_table: &Arc<SymbolTable>,
+    max_file_size: u64,
+) -> Result<CacheLoadStats, String> {
+    // Fresh filesystem scan
+    let fresh_tree = Arc::new(FileTree::new());
+    walker::scan_directory(root, &fresh_tree, max_file_size)
+        .map_err(|e| format!("Failed to scan directory: {}", e))?;
+
+    let mut stats = CacheLoadStats {
+        cached: 0,
+        changed: 0,
+        new: 0,
+        deleted: 0,
+        files_to_extract: Vec::new(),
+    };
+
+    // Collect current in-memory paths for deletion detection
+    let current_paths: HashSet<String> = file_tree.all_paths().into_iter().collect();
+    let mut fresh_paths: HashSet<String> = HashSet::new();
+
+    // Process each file from the fresh scan
+    for entry in fresh_tree.files.iter() {
+        let rel_path = entry.key().clone();
+        let fresh_entry = entry.value().clone();
+        fresh_paths.insert(rel_path.clone());
+
+        if let Some(existing) = file_tree.get(&rel_path) {
+            if existing.modified == fresh_entry.modified
+                && existing.size == fresh_entry.size
+            {
+                // Unchanged
+                stats.cached += 1;
+            } else {
+                // Modified — update entry, remove stale symbols, mark for re-extraction
+                file_tree.insert(fresh_entry);
+                symbol_table.remove_file(&rel_path);
+                stats.changed += 1;
+                stats.files_to_extract.push(rel_path.clone());
+                debug!("File changed: {}", rel_path);
+            }
+        } else {
+            // New file
+            file_tree.insert(fresh_entry);
+            stats.new += 1;
+            stats.files_to_extract.push(rel_path.clone());
+            debug!("New file: {}", rel_path);
+        }
+    }
+
+    // Remove deleted files
+    for path in &current_paths {
+        if !fresh_paths.contains(path) {
+            file_tree.remove(path);
+            symbol_table.remove_file(path);
+            stats.deleted += 1;
+            debug!("Deleted file: {}", path);
+        }
+    }
+
+    info!(
+        "Reindex complete: {} unchanged, {} changed, {} new, {} deleted, {} to re-extract",
+        stats.cached,
+        stats.changed,
+        stats.new,
+        stats.deleted,
+        stats.files_to_extract.len()
+    );
+
+    Ok(stats)
+}

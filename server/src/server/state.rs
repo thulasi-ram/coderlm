@@ -8,20 +8,17 @@ use parking_lot::Mutex;
 use tracing::info;
 
 use crate::index::file_tree::FileTree;
-use crate::index::{walker, watcher};
+use crate::index::walker;
 use crate::ops::cache;
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::symbols::{parser, SymbolTable};
 
-/// A single indexed project with its own file tree, symbol table, and watcher.
+/// A single indexed project with its own file tree and symbol table.
 pub struct Project {
     pub root: PathBuf,
     pub file_tree: Arc<FileTree>,
     pub symbol_table: Arc<SymbolTable>,
-    // Held alive to keep the filesystem watcher running; dropped on eviction.
-    #[allow(dead_code)]
-    pub watcher: Option<watcher::WatcherHandle>,
     pub last_active: Mutex<DateTime<Utc>>,
 }
 
@@ -116,20 +113,10 @@ impl AppState {
             }
         };
 
-        // Start watcher
-        let watcher_handle = watcher::start_watcher(
-            &canonical,
-            file_tree.clone(),
-            symbol_table.clone(),
-            max_file_size,
-        )
-        .ok();
-
         let project = Arc::new(Project {
             root: canonical.clone(),
             file_tree: file_tree.clone(),
             symbol_table: symbol_table.clone(),
-            watcher: watcher_handle,
             last_active: Mutex::new(Utc::now()),
         });
 
@@ -209,7 +196,6 @@ impl AppState {
 
         info!("Evicting project: {}", path.display());
 
-        // Remove the project (drops watcher)
         self.inner.projects.remove(&path);
 
         // Remove all sessions attached to this project

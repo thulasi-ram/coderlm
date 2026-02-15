@@ -20,10 +20,6 @@ clap = { version = "4", features = ["derive"] }
 # File walking (gitignore-aware, from ripgrep)
 ignore = "0.4"
 
-# Filesystem watching
-notify = "8"
-notify-debouncer-mini = "0.7"
-
 # Tree-sitter
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"

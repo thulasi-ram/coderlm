@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use crate::ops::{annotations, cache, content, history, structure, symbol_ops};
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::server::state::{AppState, Project};
+use crate::symbols::parser;
 use crate::symbols::symbol::SymbolKind;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,8 @@ pub fn build_routes(state: AppState) -> Router {
         // Index cache
         .route("/api/v1/index/save", post(save_index))
         .route("/api/v1/index/load", post(load_index))
+        // Re-index
+        .route("/api/v1/reindex", post(reindex))
         .with_state(state)
 }
 
@@ -716,5 +720,54 @@ async fn load_index(
         "new": stats.new,
         "deleted": stats.deleted,
         "files_to_extract": stats.files_to_extract.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Re-index
+// ---------------------------------------------------------------------------
+
+async fn reindex(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    let stats = cache::reindex(
+        &project.root,
+        &project.file_tree,
+        &project.symbol_table,
+        state.inner.max_file_size,
+    )
+    .map_err(AppError::Internal)?;
+
+    let changed = stats.changed;
+    let new = stats.new;
+    let deleted = stats.deleted;
+    let cached = stats.cached;
+    let to_extract = stats.files_to_extract.len();
+
+    // Spawn background symbol extraction for changed/new files
+    if !stats.files_to_extract.is_empty() {
+        let ft = project.file_tree.clone();
+        let st = project.symbol_table.clone();
+        let root = project.root.clone();
+        let only_files: HashSet<String> = stats.files_to_extract.into_iter().collect();
+        tokio::spawn(async move {
+            tracing::info!("Starting incremental symbol extraction for {}...", root.display());
+            match parser::extract_all_symbols(&root, &ft, &st, Some(only_files)).await {
+                Ok(count) => tracing::info!("Extracted {} symbols for {}", count, root.display()),
+                Err(e) => tracing::error!("Symbol extraction failed for {}: {}", root.display(), e),
+            }
+        });
+    }
+
+    record_history(&state, session_id(&headers).as_deref(), "POST", "/reindex", "reindexed");
+    Ok(Json(json!({
+        "ok": true,
+        "unchanged": cached,
+        "changed": changed,
+        "new": new,
+        "deleted": deleted,
+        "files_to_extract": to_extract,
     })))
 }
