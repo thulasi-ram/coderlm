@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::index::file_entry::Language;
 use crate::index::file_tree::FileTree;
+use crate::ops::cache;
 use crate::symbols::queries;
 use crate::symbols::symbol::{Symbol, SymbolKind};
 use crate::symbols::SymbolTable;
@@ -205,12 +206,16 @@ pub async fn extract_all_symbols(
             match extract_symbols_from_file(&root, &rel_path, language) {
                 Ok(symbols) => {
                     let count = symbols.len();
-                    for sym in symbols {
-                        symbol_table.insert(sym);
+                    for sym in &symbols {
+                        symbol_table.insert(sym.clone());
                     }
                     // Mark file as having symbols extracted
                     if let Some(mut entry) = file_tree.files.get_mut(&rel_path) {
                         entry.symbols_extracted = true;
+                        // Save per-file cache immediately (crash-safe)
+                        if let Err(e) = cache::save_file_cache(&root, &entry, &symbols) {
+                            debug!("Failed to cache {}: {}", rel_path, e);
+                        }
                     }
                     total += count;
                 }
